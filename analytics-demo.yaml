@@ -1,0 +1,1079 @@
+AWSTemplateFormatVersion: "2010-09-09"
+### Summary
+#
+# This CF will build a Data Analytics pipeline:
+# - VPC
+# - VPC Gateway Endpoint for S3
+# - VPC Interface Endpoint for AWS Glue
+# - NAT Gateway
+# - S3 buckets (Temp bucket and Data Lake bucket)
+# - EC2 with PSQL client (PSQL host)
+# - RDS PostgreSQL DBinstance
+# - Redshift cluster
+# - IAM Role for Redshift and DMS service, to access S3 and Glue resources
+# - IAM Role for EC2 Instance Profile
+# - SSM Session Manager Config
+# - Glue databases and a connection
+#
+# IMPORTANT!
+#
+# This CF template must be provisioned on Region "us-east-1" (N. Virginia)
+#
+###
+Description: >-
+  End-to-End Data Analytics Pipeline Demo
+Parameters:
+  LabVPCCIDR:
+    Description: CIDR Block for Lab VPC
+    Type: String
+    Default: 10.1.0.0/16
+    AllowedValues:
+      - 10.1.0.0/16
+
+  LabVPCPublicSubnetCIDR:
+    Description: Lab VPC Public Subnet
+    Type: String
+    Default: 10.1.10.0/24
+    AllowedValues:
+      - 10.1.10.0/24
+
+  LabVPCPrivateSubnetCIDR1:
+    Description: Lab VPC Private Subnet 1
+    Type: String
+    Default: 10.1.20.0/24
+    AllowedValues:
+      - 10.1.20.0/24
+
+  LabVPCPrivateSubnetCIDR2:
+    Description: Lab VPC Private Subnet 2
+    Type: String
+    Default: 10.1.30.0/24
+    AllowedValues:
+      - 10.1.30.0/24
+
+  CustAMIId:
+    Type: String
+    Default: ami-0ee3dd41c47751fe6
+    AllowedValues:
+      - ami-0ee3dd41c47751fe6
+
+  DBInstanceName:
+    Description: The name of DBinstance being created
+    Type: String
+    Default: dbinsurance
+    AllowedPattern: "([a-z])+"
+
+  DBinstanceClassRDS:
+    Description: The type of DBinstance to be provisioned
+    Type: String
+    Default: db.m5.2xlarge
+    AllowedValues:
+      - db.m5.2xlarge
+
+  DatabaseNameRDS:
+    Description: The name of the first database to be created when the DBInstance is created
+    Type: String
+    Default: dbinsurance
+    AllowedPattern: "([a-z]|[0-9])+"
+
+  MasterUsernameRDS:
+    Description: >-
+      The user name that is associated with the master user account for the
+      DBInstance that is being created
+    Type: String
+    Default: postgres
+    AllowedPattern: "([a-z])([a-z]|[0-9])*"
+
+  MasterUserPasswordRDS:
+    Description: >-
+      The password that is associated with the master user account for the
+      DBInstance that is being created.
+    Type: String
+    Default: pg#lab!hol
+    NoEcho: "true"
+
+  RSClusterName:
+    Description: The name of Redshift cluster being created
+    Type: String
+    Default: rsclusterinsurance
+    AllowedPattern: "([a-z])+"
+
+  DatabaseNameRS:
+    Description: The name of the first database to be created when the cluster is created
+    Type: String
+    Default: dbdw
+    AllowedPattern: "([a-z]|[0-9])+"
+
+  ClusterType:
+    Description: The type of cluster
+    Type: String
+    Default: multi-node
+    AllowedValues:
+      - single-node
+      - multi-node
+
+  NumberOfNodes:
+    Description: >-
+      The number of compute nodes in the cluster. For multi-node clusters, the
+      NumberOfNodes parameter must be greater than 1
+    Type: Number
+    Default: "2"
+
+  NodeType:
+    Description: The type of node to be provisioned
+    Type: String
+    Default: dc2.large
+    AllowedValues:
+      - dc2.large
+
+  MasterUsernameRS:
+    Description: >-
+      The user name that is associated with the master user account for the
+      cluster that is being created
+    Type: String
+    Default: awsuser
+    AllowedPattern: "([a-z])([a-z]|[0-9])*"
+
+  MasterUserPasswordRS:
+    Description: >-
+      The password that is associated with the master user account for the
+      cluster that is being created.
+    Type: String
+    Default: RedSh!ft#123
+    NoEcho: "true"
+
+  DBPortNumber:
+    Description: The port number on which the BDinstance accepts incoming connections.
+    Type: Number
+    Default: "5432"
+
+  PortNumber:
+    Description: The port number on which the cluster accepts incoming connections.
+    Type: Number
+    Default: "5439"
+
+  GlueDATechDBName:
+    Description: The name of the Glue Data Catalog database for Redshift tables.
+    Type: String
+    AllowedPattern: '([ \t\n\x0B\f\r])*|([a-z])([\-]|[a-z]|[\-]|[0-9])*'
+    ConstraintDescription: must start with a-z and contain only a-z or 0-9 or hyphen (-).
+    Default: "datechdb"
+
+  GlueSpectrumDBName:
+    Description: The name of the Glue Data Catalog database for Data Lake tables.
+    Type: String
+    AllowedPattern: '([ \t\n\x0B\f\r])*|([a-z])([\-]|[a-z]|[\-]|[0-9])*'
+    ConstraintDescription: must start with a-z and contain only a-z or 0-9 or hyphen (-).
+    Default: "spectrumdb"
+
+  GlueRedshiftConnectionName:
+    Description: The name of the Glue Data Connection for Redshift.
+    Type: String
+    AllowedPattern: '([ \t\n\x0B\f\r])*|([a-z])([\-]|[a-z]|[\-]|[0-9])*'
+    ConstraintDescription: must start with a-z and contain only a-z or 0-9 or hyphen (-).
+    Default: "redshift-insurance"
+
+  QuickSightCidrIp:
+    Description: CIDR IP for Amazon QuickSight access on Region "us-east-1" (N. Virginia).
+    Type: String
+    Default: "54.70.204.128/27"
+    AllowedValues:
+      - "54.70.204.128/27"
+
+  ReplicationTaskIdentifier:
+    Description: The identifier of the replication task
+    Type: String
+    Default: postgres-redshift-migration
+
+Resources:
+  #---------- IAM ---------------
+  LabGlueRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName:
+        !Join ["-", ["LabGlueRole", !Ref "AWS::AccountId", !Ref "AWS::Region"]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Sid: ""
+            Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+        - "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+        - "arn:aws:iam::aws:policy/AmazonRedshiftFullAccess"
+      Path: /
+
+  LabRSDMSRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName:
+        !Join ["-", ["LabRSDMSRole", !Ref "AWS::AccountId", !Ref "AWS::Region"]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Sid: "1"
+            Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: "sts:AssumeRole"
+          - Sid: "2"
+            Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: "sts:AssumeRole"
+          - Sid: "3"
+            Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+        - "arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess"
+        - "arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole"
+        - "arn:aws:iam::aws:policy/service-role/AmazonDMSCloudWatchLogsRole"
+      Path: /
+
+  LabEC2Role:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName:
+        !Join ["-", ["LabEC2Role", !Ref "AWS::AccountId", !Ref "AWS::Region"]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Sid: ""
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: /
+
+  LabEC2RolePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: SessionManagerPermissionsPolicy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - "ssm:UpdateInstanceInformation"
+              - "ssmmessages:CreateControlChannel"
+              - "ssmmessages:CreateDataChannel"
+              - "ssmmessages:OpenControlChannel"
+              - "ssmmessages:OpenDataChannel"
+            Resource: "*"
+          - Effect: Allow
+            Action: s3:GetEncryptionConfiguration
+            Resource: "*"
+      Roles:
+        - !Ref LabEC2Role
+
+  LabEC2InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: /
+      Roles:
+        - !Ref LabEC2Role
+
+  DMSVPCRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dms-vpc-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - dms.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole
+
+  DMSAccessRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "dms-access-for-endpoint"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "dms.amazonaws.com"
+                - "redshift.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSRedshiftS3Role
+
+  DMSCloudwatchLogsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "dms-cloudwatch-logs-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "dms.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSCloudWatchLogsRole
+
+  TempS3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName:
+        !Join [
+          "-",
+          [
+            "dms-rs-glue-temp-bucket",
+            !Ref "AWS::AccountId",
+            !Ref "AWS::Region",
+          ],
+        ]
+
+  DatalakeS3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName:
+        !Join [
+          "-",
+          ["datalake-bucket", !Ref "AWS::AccountId", !Ref "AWS::Region"],
+        ]
+
+  #----------- SSM ---------------
+  SessionPreferencesDocument:
+    Type: "AWS::SSM::Document"
+    Properties:
+      Name: SSM-SessionManagerRunShell-Custom
+      DocumentType: Session
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: "1.0"
+        description: Document to hold regional settings for Session Manager
+        sessionType: Standard_Stream
+        inputs:
+          s3BucketName: ""
+          s3KeyPrefix: ""
+          s3EncryptionEnabled: true
+          cloudWatchLogGroupName: ""
+          cloudWatchEncryptionEnabled: true
+          cloudWatchStreamingEnabled: true
+          kmsKeyId: ""
+          runAsEnabled: false
+          runAsDefaultUser: ""
+          idleSessionTimeout: "30"
+          shellProfile:
+            windows: ""
+            linux: "sudo su - ec2-user"
+
+  #---------- VPC ---------------
+  LabVPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: !Ref LabVPCCIDR
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      Tags:
+        - Key: VPC
+          Value: DATech-VPC
+        - Key: Name
+          Value: DATech-VPC
+
+  LabIGW:
+    Type: "AWS::EC2::InternetGateway"
+    DependsOn: LabVPC
+
+  LabVPCAttachGateway:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref LabVPC
+      InternetGatewayId: !Ref LabIGW
+
+  LabPubSubnet:
+    Type: "AWS::EC2::Subnet"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: !Ref LabVPCPublicSubnetCIDR
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: us-east-1a
+      Tags:
+        - Key: Name
+          Value: DATech-VPC Public Subnet
+
+  LabPrivSubnet1:
+    Type: "AWS::EC2::Subnet"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: !Ref LabVPCPrivateSubnetCIDR1
+      AvailabilityZone: us-east-1a
+      Tags:
+        - Key: Name
+          Value: DATech-VPC Private Subnet 1
+
+  LabPrivSubnet2:
+    Type: "AWS::EC2::Subnet"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: !Ref LabVPCPrivateSubnetCIDR2
+      AvailabilityZone: us-east-1b
+      Tags:
+        - Key: Name
+          Value: DATech-VPC Private Subnet 2
+
+  LabPubRT:
+    Type: "AWS::EC2::RouteTable"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      VpcId: !Ref LabVPC
+      Tags:
+        - Key: Name
+          Value: DATech-VPC Public Route Table
+
+  LabPrivRT:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref LabVPC
+      Tags:
+        - Key: Name
+          Value: DATech-VPC Private Route Table
+
+  LabPublicRoute:
+    Type: "AWS::EC2::Route"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      RouteTableId: !Ref LabPubRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref LabIGW
+
+  LabPublicSubnetRouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      SubnetId: !Ref LabPubSubnet
+      RouteTableId: !Ref LabPubRT
+
+  LabPrivateSubnet1RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref LabPrivSubnet1
+      RouteTableId: !Ref LabPrivRT
+
+  LabPrivateSubnet2RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref LabPrivSubnet2
+      RouteTableId: !Ref LabPrivRT
+
+  LabVPCEndpointS3Gateway:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - "*"
+            Resource:
+              - "*"
+      RouteTableIds:
+        - !Ref LabPubRT
+        - !Ref LabPrivRT
+      ServiceName: "com.amazonaws.us-east-1.s3"
+      VpcId: !Ref LabVPC
+
+  LabVPCEndpointGlueInterface:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - "*"
+            Resource:
+              - "*"
+      SecurityGroupIds:
+        - !Ref RedshiftClusterSG
+      SubnetIds:
+        - !Ref LabPrivSubnet1
+      ServiceName: "com.amazonaws.us-east-1.glue"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref LabVPC
+
+  LabVPCEndpointDMSInterface:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - "*"
+            Resource:
+              - "*"
+      SecurityGroupIds:
+        - !Ref RedshiftClusterSG
+      SubnetIds:
+        - !Ref LabPrivSubnet1
+        - !Ref LabPrivSubnet2
+      ServiceName: "com.amazonaws.us-east-1.dms"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref LabVPC
+
+  LabEIP:
+    Type: "AWS::EC2::EIP"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      Domain: vpc
+
+  LabNATGW:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt LabEIP.AllocationId
+      SubnetId: !Ref LabPubSubnet
+
+  LabPrivNATRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref LabPrivRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref LabNATGW
+
+  #--------- Security Groups -------------
+  PsqlHostSG:
+    Type: "AWS::EC2::SecurityGroup"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      GroupDescription: Security Group to access EC2 PSQL host
+      GroupName:
+        !Join ["-", ["PsqlHostSG", !Ref "AWS::AccountId", !Ref "AWS::Region"]]
+      VpcId: !Ref LabVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: 0.0.0.0/0
+
+  DMSRepInstanceSG:
+    Type: "AWS::EC2::SecurityGroup"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      GroupDescription: Security Group for AWS DMS replication instance
+      GroupName:
+        !Join [
+          "-",
+          ["DMSRepInstanceSG", !Ref "AWS::AccountId", !Ref "AWS::Region"],
+        ]
+      VpcId: !Ref LabVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: 0.0.0.0/0
+
+  DMSRepInstanceSGIngressSelf:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: tcp
+      FromPort: "0"
+      ToPort: "65535"
+      Description: Self-reference ingress rule
+      SourceSecurityGroupId: !GetAtt DMSRepInstanceSG.GroupId
+      GroupId: !GetAtt DMSRepInstanceSG.GroupId
+
+  RedshiftClusterSG:
+    Type: "AWS::EC2::SecurityGroup"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      GroupDescription: Security Group for Redshift Cluster [rsclusterinsurance]
+      GroupName:
+        !Join [
+          "-",
+          ["RedshiftClusterSG", !Ref "AWS::AccountId", !Ref "AWS::Region"],
+        ]
+      VpcId: !Ref LabVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "5439"
+          ToPort: "5439"
+          CidrIp: !Ref QuickSightCidrIp
+          Description: Amazon QuickSight access
+        - IpProtocol: tcp
+          FromPort: "5439"
+          ToPort: "5439"
+          SourceSecurityGroupId: !GetAtt PsqlHostSG.GroupId
+        - IpProtocol: tcp
+          FromPort: "0"
+          ToPort: "65535"
+          SourceSecurityGroupId: !GetAtt DMSRepInstanceSG.GroupId
+
+  RedshiftClusterSGIngressSelf:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: tcp
+      FromPort: "0"
+      ToPort: "65535"
+      Description: Self-reference ingress rule
+      SourceSecurityGroupId: !GetAtt RedshiftClusterSG.GroupId
+      GroupId: !GetAtt RedshiftClusterSG.GroupId
+
+  RDSPostgreSQLSGIngressDMS:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: tcp
+      FromPort: "5432"
+      ToPort: "5432"
+      Description: DMS access
+      SourceSecurityGroupId: !GetAtt DMSRepInstanceSG.GroupId
+      GroupId: !GetAtt RDSPostgreSQLSG.GroupId
+
+  RedshiftClusterSGIngressQuicksight:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: tcp
+      FromPort: "5439"
+      ToPort: "5439"
+      Description: Amazon QuickSight access
+      SourceSecurityGroupId: !GetAtt QuickSightToRedshiftSG.GroupId
+      GroupId: !GetAtt RedshiftClusterSG.GroupId
+
+  QuickSightToRedshiftSG:
+    Type: "AWS::EC2::SecurityGroup"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      GroupDescription: Security Group for Quicksight connection to Redshift Cluster [rsclusterinsurance]
+      GroupName:
+        !Join [
+          "-",
+          ["QuickSightToRedshiftSG", !Ref "AWS::AccountId", !Ref "AWS::Region"],
+        ]
+      VpcId: !Ref LabVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: "5439"
+          ToPort: "5439"
+          DestinationSecurityGroupId: !GetAtt RedshiftClusterSG.GroupId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "0"
+          ToPort: "65535"
+          SourceSecurityGroupId: !GetAtt RedshiftClusterSG.GroupId
+
+  RDSPostgreSQLSG:
+    Type: "AWS::EC2::SecurityGroup"
+    DependsOn: LabVPCAttachGateway
+    Properties:
+      GroupDescription: Security Group for RDS PostgreSQl DBinstance [dbinsurance]
+      GroupName:
+        !Join [
+          "-",
+          ["RDSPostgreSQLSG", !Ref "AWS::AccountId", !Ref "AWS::Region"],
+        ]
+      VpcId: !Ref LabVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: "0"
+          ToPort: "65535"
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "5432"
+          ToPort: "5432"
+          SourceSecurityGroupId: !GetAtt PsqlHostSG.GroupId
+        - IpProtocol: tcp
+          FromPort: "0"
+          ToPort: "65535"
+          SourceSecurityGroupId: !GetAtt DMSRepInstanceSG.GroupId
+
+  #------ RDS PostgreSQL ----------
+  LabRDSPostgreSQLDBinstanceSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: Subnet Group for RDS PostgreSQL DBInstance
+      SubnetIds:
+        - !Ref LabPrivSubnet1
+        - !Ref LabPrivSubnet2
+
+  LabRDSDBParameterGroup:
+    Type: "AWS::RDS::DBParameterGroup"
+    Properties:
+      Description: Parameter group for RDS PostgreSQL DBInstance
+      Family: postgres14
+      Parameters:
+        shared_preload_libraries: pglogical
+        rds.logical_replication: 1
+
+  LabRDSPostgreSQLDBinstance:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      DBInstanceIdentifier: !Ref DBInstanceName
+      Engine: postgres
+      DBInstanceClass: !Ref DBinstanceClassRDS
+      StorageType: gp2
+      AllocatedStorage: 20
+      MasterUsername: !Ref MasterUsernameRDS
+      MasterUserPassword: !Ref MasterUserPasswordRDS
+      VPCSecurityGroups:
+        - !Ref RDSPostgreSQLSG
+      DBSubnetGroupName: !Ref LabRDSPostgreSQLDBinstanceSubnetGroup
+      DBParameterGroupName: !Ref LabRDSDBParameterGroup
+      Port: !Ref DBPortNumber
+      PubliclyAccessible: "false"
+
+  #--------- Redshift -------------
+  LabRedshiftSubnetGroup:
+    Type: "AWS::Redshift::ClusterSubnetGroup"
+    Properties:
+      Description: Subnet Group for Redshift cluster
+      SubnetIds:
+        - !Ref LabPrivSubnet1
+
+  LabRedshiftCluster:
+    Type: "AWS::Redshift::Cluster"
+    Properties:
+      ClusterIdentifier: !Ref RSClusterName
+      ClusterType: !Ref ClusterType
+      NumberOfNodes: !Ref NumberOfNodes
+      NodeType: !Ref NodeType
+      MasterUsername: !Ref MasterUsernameRS
+      MasterUserPassword: !Ref MasterUserPasswordRS
+      IamRoles:
+        - !GetAtt LabRSDMSRole.Arn
+      VpcSecurityGroupIds:
+        - !Ref RedshiftClusterSG
+      ClusterSubnetGroupName: !Ref LabRedshiftSubnetGroup
+      PubliclyAccessible: "false"
+      Port: !Ref PortNumber
+      DBName: !Ref DatabaseNameRS
+
+  #--------- DMS -------------
+  MyDMSSubnetGroup:
+    Type: "AWS::DMS::ReplicationSubnetGroup"
+    Properties:
+      ReplicationSubnetGroupIdentifier: labvpc
+      ReplicationSubnetGroupDescription: DMS subnet group
+      SubnetIds:
+        - !Ref LabPrivSubnet1
+        - !Ref LabPrivSubnet2
+
+  DMSReplicationInstance:
+    Type: "AWS::DMS::ReplicationInstance"
+    Properties:
+      ReplicationInstanceIdentifier: "replication-instance"
+      EngineVersion: "3.4.5"
+      ReplicationInstanceClass: "dms.r4.large"
+      AllocatedStorage: 100
+      VpcSecurityGroupIds:
+        - !GetAtt DMSRepInstanceSG.GroupId
+      PubliclyAccessible: false
+      MultiAZ: false
+      ReplicationSubnetGroupIdentifier: !Ref MyDMSSubnetGroup
+
+  TargetDMSReplicationEndpoint:
+    Type: "AWS::DMS::Endpoint"
+    Properties:
+      EndpointIdentifier: "rsclusterinsurance"
+      EndpointType: "target"
+      EngineName: "redshift"
+      ServerName: !GetAtt LabRedshiftCluster.Endpoint.Address
+      Port: !Ref PortNumber
+      Username: !Ref MasterUsernameRS
+      Password: !Ref MasterUserPasswordRS
+      DatabaseName: !Ref DatabaseNameRS
+      S3Settings:
+        BucketName: !Ref TempS3Bucket
+        BucketFolder: "insurance"
+        ServiceAccessRoleArn: !GetAtt DMSAccessRole.Arn
+
+  SourceDMSReplicationEndpoint:
+    Type: "AWS::DMS::Endpoint"
+    Properties:
+      EndpointIdentifier: "dbinsurance"
+      EndpointType: "source"
+      EngineName: "postgres"
+      Password: !Ref MasterUserPasswordRDS
+      ServerName: !GetAtt LabRDSPostgreSQLDBinstance.Endpoint.Address
+      Port: 5432
+      Username: postgres
+      DatabaseName: dbinsurance
+
+  DMSReplicationTask:
+    Type: "AWS::DMS::ReplicationTask"
+    Properties:
+      ReplicationTaskIdentifier: !Ref ReplicationTaskIdentifier
+      SourceEndpointArn: !Ref SourceDMSReplicationEndpoint
+      TargetEndpointArn: !Ref TargetDMSReplicationEndpoint
+      ReplicationInstanceArn: !Ref DMSReplicationInstance
+      MigrationType: full-load-and-cdc
+      TableMappings: |
+        {
+          "rules": [
+            {
+              "rule-type": "selection",
+              "rule-id": "1",
+              "rule-name": "1",
+              "object-locator": {
+                "schema-name": "public",
+                "table-name": "insurance"
+              },
+              "rule-action": "include"
+            }
+          ]
+        }
+      ReplicationTaskSettings: |
+        {
+          "TargetMetadata": {
+            "TargetSchema": "",
+            "SupportLobs": true,
+            "FullLobMode": false,
+            "LobChunkSize": 64,
+            "LimitedSizeLobMode": true,
+            "LobMaxSize": 32,
+            "LoadMaxFileSize": 0,
+            "ParallelLoadThreads": 0,
+            "ParallelLoadBufferSize": 0,
+            "BatchApplyEnabled": false,
+            "TaskRecoveryTableEnabled": false
+          },
+          "FullLoadSettings": {
+            "TargetTablePreparationMode": "TRUNCATE",
+            "CreatePkAfterFullLoad": false,
+            "StopTaskCachedChangesApplied": false,
+            "StopTaskCachedChangesNotApplied": false,
+            "MaxFullLoadSubTasks": 8,
+            "TransactionConsistencyTimeout": 600,
+            "CommitRate": 10000
+          },
+          "Logging": {
+            "EnableLogging": true
+          }
+        }
+
+  #--------- Glue ------------
+  GlueDATechDB:
+    Type: "AWS::Glue::Database"
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseInput:
+        Name: !Ref GlueDATechDBName
+        Description: "Database catalog for Redshift table"
+
+  GlueSpectrumDB:
+    Type: "AWS::Glue::Database"
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseInput:
+        Name: !Ref GlueSpectrumDBName
+        Description: "Database catalog for S3 table"
+
+  GlueRedshiftConnection:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      ConnectionInput:
+        ConnectionProperties:
+          JDBC_CONNECTION_URL:
+            !Join [
+              "",
+              [
+                "jdbc:redshift://",
+                !GetAtt LabRedshiftCluster.Endpoint.Address,
+                ":",
+                !Ref PortNumber,
+                "/",
+                !Ref DatabaseNameRS,
+              ],
+            ]
+          USERNAME: !Ref MasterUsernameRS
+          PASSWORD: !Ref MasterUserPasswordRS
+        ConnectionType: JDBC
+        Description: "Redshift - Insurance data summarized"
+        Name: !Ref GlueRedshiftConnectionName
+        PhysicalConnectionRequirements:
+          AvailabilityZone: !GetAtt LabPubSubnet.AvailabilityZone
+          SecurityGroupIdList:
+            - !Ref RedshiftClusterSG
+          SubnetId: !Ref LabPubSubnet
+
+  GlueCrawler:
+    Type: "AWS::Glue::Crawler"
+    Properties:
+      Name: "RSCrawler"
+      Role: !GetAtt "LabGlueRole.Arn"
+      DatabaseName: "datechdb"
+      Targets:
+        JdbcTargets:
+          - ConnectionName: !Ref GlueRedshiftConnection
+            Path: "dbdw/public/insurance"
+      SchemaChangePolicy:
+        DeleteBehavior: "DEPRECATE_IN_DATABASE"
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+
+  #--------- EC2 -------------
+  LabHost:
+    Type: "AWS::EC2::Instance"
+    DependsOn: LabVPC
+    Properties:
+      ImageId: !Ref CustAMIId
+      InstanceType: t3.small
+      SubnetId: !Ref LabPubSubnet
+      IamInstanceProfile: !Ref LabEC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref PsqlHostSG
+      Tags:
+        - Key: Name
+          Value: PSQL Host
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          yum install postgresql -y
+          yum update -y
+          amazon-linux-extras install postgresql12
+          yum install postgresql-server -y
+          yum install postgresql-libs -y
+          mkdir /home/ec2-user/bin
+          mkdir /home/ec2-user/pgcfg
+          echo "${LabRDSPostgreSQLDBinstance.Endpoint.Address}:${DBPortNumber}:${DatabaseNameRDS}:${MasterUsernameRDS}:${MasterUserPasswordRDS}" > /home/ec2-user/pgcfg/pgpass.conf
+          echo "${LabRedshiftCluster.Endpoint.Address}:${PortNumber}:${DatabaseNameRS}:${MasterUsernameRS}:${MasterUserPasswordRS}" >> /home/ec2-user/pgcfg/pgpass.conf
+          echo "#!/bin/bash" > /home/ec2-user/bin/psql-postgres-datech-hol.sh
+          echo "export PGPASSFILE=/home/ec2-user/pgcfg/pgpass.conf" >> /home/ec2-user/bin/psql-postgres-datech-hol.sh
+          echo "export PGCLIENTENCODING=UTF8" >> /home/ec2-user/bin/psql-postgres-datech-hol.sh
+          echo "export PSQL_DIR=/usr/bin" >> /home/ec2-user/bin/psql-postgres-datech-hol.sh
+          echo "export PG_HOST=${LabRDSPostgreSQLDBinstance.Endpoint.Address}" >> /home/ec2-user/bin/psql-postgres-datech-hol.sh
+          echo "\$PSQL_DIR/psql --host=\$PG_HOST --port=${DBPortNumber} --username=${MasterUsernameRDS} --dbname=${DatabaseNameRDS}" >> /home/ec2-user/bin/psql-postgres-datech-hol.sh
+          echo "#!/bin/bash" > /home/ec2-user/bin/psql-redshift-datech-hol.sh
+          echo "export PGPASSFILE=/home/ec2-user/pgcfg/pgpass.conf" >> /home/ec2-user/bin/psql-redshift-datech-hol.sh
+          echo "export PGCLIENTENCODING=UTF8" >> /home/ec2-user/bin/psql-redshift-datech-hol.sh
+          echo "export PSQL_DIR=/usr/bin" >> /home/ec2-user/bin/psql-redshift-datech-hol.sh
+          echo "export PG_HOST=${LabRedshiftCluster.Endpoint.Address}" >> /home/ec2-user/bin/psql-redshift-datech-hol.sh
+          echo "\$PSQL_DIR/psql --host=\$PG_HOST --port=${PortNumber} --username=${MasterUsernameRS} --dbname=${DatabaseNameRS}" >> /home/ec2-user/bin/psql-redshift-datech-hol.sh
+          # Steps for downloading data, creating a table, and copying data
+          wget https://raw.githubusercontent.com/bryantanjw/aws-data-analytics/main/data/insurancedata.csv -O insurancedata.csv
+          echo "export PGPASSWORD=${MasterUserPasswordRDS}" >> /home/ec2-user/bin/psql-postgres-datech-hol.sh
+          export PGPASSWORD=${MasterUserPasswordRDS}
+          echo "CREATE DATABASE ${DatabaseNameRDS};" | /usr/bin/psql --host=${LabRDSPostgreSQLDBinstance.Endpoint.Address} --port=${DBPortNumber} --username=${MasterUsernameRDS}
+          echo "CREATE extension pglogical;" | /usr/bin/psql --host=${LabRDSPostgreSQLDBinstance.Endpoint.Address} --port=${DBPortNumber} --username=${MasterUsernameRDS}
+          echo "CREATE TABLE insurance (\"Agent Code\" INTEGER,\"Agent Name\" VARCHAR(100),\"City\" VARCHAR(100),\"State\" VARCHAR(50),\"Company\" VARCHAR(100),\"Distribution Channel\" VARCHAR(100),\"EndDate\" DATE,\"GenerationDate\" DATE,\"Industry\" VARCHAR(100),\"Insured Employee Tier\" VARCHAR(50),\"Line of Business\" VARCHAR(100),\"LOB Code\" VARCHAR(50),\"New or Renewal\" VARCHAR(50),\"One Month Prior\" DATE,\"Policy Effective Date\" DATE,\"Policy Effective Year\" INTEGER,\"Policy Expiration Date\" DATE,\"Policy Number\" INTEGER,\"ProducerProfitCenterID\" INTEGER,\"Sector\" VARCHAR(100),\"Summary Date\" DATE,\"Territory\" VARCHAR(100),\"Year\" INTEGER,\"Claim Amount\" DECIMAL,\"Earned Premium\" DECIMAL,\"Employer Size Tier\" INTEGER,\"Number of Employees\" INTEGER,\"Policy Expiring\" INTEGER,\"Policy In Force\" INTEGER,\"Premium Expiring\" DECIMAL,\"QTD Claims-IFELSE\" DECIMAL,\"QTD Written Premium-IFELSE\" DECIMAL,\"Revenue\" DECIMAL,\"Written Policy\" INTEGER,\"Written Premium\" DECIMAL,\"YTD Num Policies In Force\" INTEGER,\"YTD Written Premium-IFELSE\" DECIMAL);" | /usr/bin/psql --host=${LabRDSPostgreSQLDBinstance.Endpoint.Address} --port=${DBPortNumber} --username=${MasterUsernameRDS} --dbname=${DatabaseNameRDS}
+          echo "\COPY insurance FROM 'insurancedata.csv' DELIMITER ',' CSV HEADER;" | /usr/bin/psql --host=${LabRDSPostgreSQLDBinstance.Endpoint.Address} --port=${DBPortNumber} --username=${MasterUsernameRDS} --dbname=${DatabaseNameRDS}
+          chown ec2-user:ec2-user -R /home/ec2-user/*
+          chmod 600 /home/ec2-user/pgcfg/pgpass.conf
+          chmod +x /home/ec2-user/bin/psql-postgres-datech-hol.sh  
+          chmod +x /home/ec2-user/bin/psql-redshift-datech-hol.sh
+          # echo "create extension pglogical" | /usr/bin/psql --host=dbinsurance.cxjlen9nuvl8.us-east-1.rds.amazonaws.com --port=5432 --username=postgres
+
+Outputs:
+  LabRDSPostgreSQLDBinstanceEndpoint:
+    Value: !GetAtt LabRDSPostgreSQLDBinstance.Endpoint.Address
+    Description: RDS PostgreSQL DBInstance Endpoint.
+
+  LabRDSPostgreSQLDBinstancePort:
+    Value: !Ref DBPortNumber
+    Description: The port number on which the BDinstance accepts incoming connections.
+
+  LabRDSPostgreSQLDBinstanceUserName:
+    Value: !Ref MasterUsernameRDS
+    Description: The user name that is associated with the master user account for the DBInstance created.
+
+  LabRDSPostgreSQLDBinstancePassword:
+    Value: !Ref MasterUserPasswordRDS
+    Description: The password that is associated with the master user account for the DBInstance that created.
+
+  LabRDSPostgreSQLDBinstanceDBName:
+    Value: !Ref DatabaseNameRDS
+    Description: The name of the database, in the DBInstance, used in the Lab.
+
+  LabRedshiftClusterEndpoint:
+    Value: !GetAtt LabRedshiftCluster.Endpoint.Address
+    Description: Redshift Endpoint
+
+  LabRedshiftClusterPort:
+    Value: !Ref PortNumber
+    Description: The port number on which the cluster accepts incoming connections.
+
+  LabRedshiftClusterUserName:
+    Value: !Ref MasterUsernameRS
+    Description: The user name that is associated with the master user account for the cluster created.
+
+  LabRedshiftClusterPassword:
+    Value: !Ref MasterUserPasswordRS
+    Description: The password that is associated with the master user account for the cluster created.
+
+  LabRedshiftClusterDBName:
+    Value: !Ref DatabaseNameRS
+    Description: The name of the database, in the cluster, used in the Lab.
+
+  LabQuickSightVPC:
+    Value: !Ref LabVPC
+    Description: VPC ID used by QuickSight.
+
+  LabQuickSightSubnet:
+    Value: !Ref LabPrivSubnet1
+    Description: Subnet ID used by QuickSight.
+
+  LabQuickSightSG:
+    Value: !GetAtt QuickSightToRedshiftSG.GroupId
+    Description: VPC Security Group ID used by QuickSight.
+
+  LabRSDMSRole:
+    Value: !GetAtt LabRSDMSRole.Arn
+    Description: DMS and Redshift Service Role ARN
+
+  LabGlueRole:
+    Value: !Ref LabGlueRole
+    Description: Glue Service Role name
+
+  TempS3Bucket:
+    Value: !Ref TempS3Bucket
+    Description: The name of the temporary bucket used by AWS DMS, AWS Glue and Redshift.
+
+  DatalakeS3Bucket:
+    Value: !Ref DatalakeS3Bucket
+    Description: The name of the Data Lake bucket used by AWS Glue.
+
+  SourceDMSReplicationEndpoint:
+    Description: "The ARN of the source endpoint for DMS"
+    Value: !Ref SourceDMSReplicationEndpoint
+
+  TargetDMSReplicationEndpoint:
+    Description: "The ARN of the target endpoint for DMS"
+    Value: !Ref TargetDMSReplicationEndpoint
+
+  DMSReplicationInstance:
+    Description: "The ARN of the DMS Replication instance"
+    Value: !Ref DMSReplicationInstance
+
+  DMSReplicationTask:
+    Description: "The ARN of the DMS Replication task"
+    Value: !Ref DMSReplicationTask
